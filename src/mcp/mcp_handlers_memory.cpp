@@ -332,7 +332,6 @@ std::string MCPServer::HandleCacheStats(const std::string&) {
         }
 
         auto stats = dma->GetCacheStats();
-        auto config = dma->GetCacheConfig();
 
         json result;
         result["enabled"] = dma->IsCacheEnabled();
@@ -340,10 +339,10 @@ std::string MCPServer::HandleCacheStats(const std::string&) {
         result["misses"] = stats.misses;
         result["hit_rate"] = stats.HitRate();
         result["evictions"] = stats.evictions;
-        result["current_pages"] = stats.current_pages;
-        result["current_bytes"] = stats.current_bytes;
-        result["max_pages"] = config.max_pages;
-        result["ttl_ms"] = config.ttl_ms;
+        result["invalidations"] = stats.invalidations;
+        result["bytes_cached"] = stats.bytes_cached;
+        result["max_pages"] = dma->GetCacheMaxPages();
+        result["ttl_ms"] = dma->GetCacheTTL().count();
 
         return CreateSuccessResponse(result.dump());
 
@@ -361,27 +360,22 @@ std::string MCPServer::HandleCacheConfig(const std::string& body) {
             return CreateErrorResponse("DMA interface not available");
         }
 
-        // Get current config
-        auto config = dma->GetCacheConfig();
-
         // Update from request
         if (req.contains("enabled")) {
-            config.enabled = req["enabled"].get<bool>();
+            dma->SetCacheEnabled(req["enabled"].get<bool>());
         }
         if (req.contains("max_pages")) {
-            config.max_pages = req["max_pages"].get<size_t>();
+            dma->SetCacheMaxPages(req["max_pages"].get<size_t>());
         }
         if (req.contains("ttl_ms")) {
-            config.ttl_ms = req["ttl_ms"].get<uint32_t>();
+            dma->SetCacheTTL(std::chrono::milliseconds(req["ttl_ms"].get<uint64_t>()));
         }
 
-        dma->SetCacheConfig(config);
-
         json result;
-        result["enabled"] = config.enabled;
-        result["max_pages"] = config.max_pages;
-        result["ttl_ms"] = config.ttl_ms;
-        result["message"] = config.enabled ? "Cache enabled" : "Cache disabled";
+        result["enabled"] = dma->IsCacheEnabled();
+        result["max_pages"] = dma->GetCacheMaxPages();
+        result["ttl_ms"] = dma->GetCacheTTL().count();
+        result["message"] = dma->IsCacheEnabled() ? "Cache enabled" : "Cache disabled";
 
         return CreateSuccessResponse(result.dump());
 
@@ -401,8 +395,7 @@ std::string MCPServer::HandleCacheClear(const std::string&) {
         dma->ClearCache();
 
         json result;
-        result["cleared_pages"] = stats_before.current_pages;
-        result["cleared_bytes"] = stats_before.current_bytes;
+        result["cleared_bytes"] = stats_before.bytes_cached;
         result["message"] = "Cache cleared";
 
         return CreateSuccessResponse(result.dump());

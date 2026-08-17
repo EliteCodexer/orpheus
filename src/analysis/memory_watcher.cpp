@@ -7,6 +7,10 @@ MemoryWatcher::MemoryWatcher(ReadMemoryFunc read_func)
     : read_memory_(std::move(read_func)) {
 }
 
+MemoryWatcher::MemoryWatcher(ReadMemoryFunc read_func, ScatterReadFunc scatter_func)
+    : read_memory_(std::move(read_func)), scatter_read_(std::move(scatter_func)) {
+}
+
 MemoryWatcher::~MemoryWatcher() {
     StopAutoScan();
 }
@@ -91,51 +95,134 @@ std::vector<MemoryChange> MemoryWatcher::Scan() {
 
     std::lock_guard<std::mutex> lock(mutex_);
 
-    for (auto& [id, region] : watches_) {
-        if (!region.enabled) continue;
+    if (watches_.empty()) {
+        return changes;
+    }
 
-        // Read current value
-        auto current_value = read_memory_(region.address, region.size);
-        if (current_value.empty()) continue;
+    if (scatter_read_) {
+        // Prepare batched scatter read for all enabled watches
+        std::vector<uint32_t> active_watch_ids;
+        std::vector<ScatterRequest> requests;
+        active_watch_ids.reserve(watches_.size());
+        requests.reserve(watches_.size());
 
-        // Check for changes
-        bool changed = false;
-        if (current_value.size() == region.last_value.size()) {
-            for (size_t i = 0; i < current_value.size(); i++) {
-                if (current_value[i] != region.last_value[i]) {
-                    changed = true;
-                    break;
-                }
-            }
-        } else {
-            changed = true;
+        for (const auto& [id, region] : watches_) {
+            if (!region.enabled) continue;
+            active_watch_ids.push_back(id);
+
+            ScatterRequest req{};
+            req.address = region.address;
+            req.size = static_cast<uint32_t>(region.size);
+            req.success = false;
+            requests.push_back(req);
         }
 
-        if (changed) {
-            region.change_count++;
+        if (!requests.empty()) {
+            scatter_read_(requests);
 
-            MemoryChange change;
-            change.address = region.address;
-            change.old_value = region.last_value;
-            change.new_value = current_value;
-            change.timestamp = std::chrono::system_clock::now();
-            change.change_count = region.change_count;
+            for (size_t i = 0; i < requests.size(); ++i) {
+                const auto& req = requests[i];
+                if (!req.success || req.data.empty()) continue;
 
-            changes.push_back(change);
+                uint32_t id = active_watch_ids[i];
+                auto it = watches_.find(id);
+                if (it == watches_.end()) continue;
+                auto& region = it->second;
 
-            // Record to history
-            if (change_history_.size() >= MAX_HISTORY) {
-                change_history_.erase(change_history_.begin());
+                const auto& current_value = req.data;
+
+                // Check for changes
+                bool changed = false;
+                if (current_value.size() == region.last_value.size()) {
+                    for (size_t j = 0; j < current_value.size(); j++) {
+                        if (current_value[j] != region.last_value[j]) {
+                            changed = true;
+                            break;
+                        }
+                    }
+                } else {
+                    changed = true;
+                }
+
+                if (changed) {
+                    region.change_count++;
+
+                    MemoryChange change;
+                    change.watch_id = id;
+                    change.name = region.name;
+                    change.address = region.address;
+                    change.old_value = region.last_value;
+                    change.new_value = current_value;
+                    change.timestamp = std::chrono::system_clock::now();
+                    change.change_count = region.change_count;
+
+                    changes.push_back(change);
+
+                    // Record to history
+                    if (change_history_.size() >= MAX_HISTORY) {
+                        change_history_.erase(change_history_.begin());
+                    }
+                    change_history_.push_back(change);
+                    total_changes_++;
+
+                    // Update last value
+                    region.last_value = current_value;
+
+                    if (change_callback_) {
+                        change_callback_(change);
+                    }
+                }
             }
-            change_history_.push_back(change);
-            total_changes_++;
+        }
+    } else if (read_memory_) {
+        // Fallback to sequential read
+        for (auto& [id, region] : watches_) {
+            if (!region.enabled) continue;
 
-            // Update last value
-            region.last_value = std::move(current_value);
+            // Read current value
+            auto current_value = read_memory_(region.address, region.size);
+            if (current_value.empty()) continue;
 
-            // Call callback outside lock would be better, but for simplicity...
-            if (change_callback_) {
-                change_callback_(change);
+            // Check for changes
+            bool changed = false;
+            if (current_value.size() == region.last_value.size()) {
+                for (size_t i = 0; i < current_value.size(); i++) {
+                    if (current_value[i] != region.last_value[i]) {
+                        changed = true;
+                        break;
+                    }
+                }
+            } else {
+                changed = true;
+            }
+
+            if (changed) {
+                region.change_count++;
+
+                MemoryChange change;
+                change.watch_id = id;
+                change.name = region.name;
+                change.address = region.address;
+                change.old_value = region.last_value;
+                change.new_value = current_value;
+                change.timestamp = std::chrono::system_clock::now();
+                change.change_count = region.change_count;
+
+                changes.push_back(change);
+
+                // Record to history
+                if (change_history_.size() >= MAX_HISTORY) {
+                    change_history_.erase(change_history_.begin());
+                }
+                change_history_.push_back(change);
+                total_changes_++;
+
+                // Update last value
+                region.last_value = std::move(current_value);
+
+                if (change_callback_) {
+                    change_callback_(change);
+                }
             }
         }
     }

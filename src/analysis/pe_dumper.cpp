@@ -1,4 +1,5 @@
 #include "pe_dumper.h"
+#include "utils/memory_reader.h"
 #include <cstring>
 #include <algorithm>
 
@@ -22,6 +23,18 @@ constexpr int DIR_IAT = 12;
 
 PEDumper::PEDumper(ReadMemoryFunc read_func)
     : read_memory_(std::move(read_func)) {
+}
+
+PEDumper::PEDumper(DMAInterface* dma, uint32_t pid)
+    : dma_(dma), pid_(pid) {
+    if (dma_) {
+        read_memory_ = [dma, pid](uint64_t addr, size_t size) -> std::vector<uint8_t> {
+            return dma->ReadMemory(pid, addr, size);
+        };
+        scatter_read_ = [dma, pid](std::vector<ScatterRequest>& requests) -> bool {
+            return dma->ScatterRead(pid, requests);
+        };
+    }
 }
 
 template<typename T>
@@ -63,6 +76,11 @@ uint32_t PEDumper::RvaToOffset(uint32_t rva, const std::vector<PE_SECTION_HEADER
 }
 
 bool PEDumper::ParseHeaders(uint64_t base_address) {
+    // If DMA interface is available, mark header region as static in cache
+    if (dma_) {
+        dma_->GetCache().SetStaticRegion(static_cast<uint32_t>(base_address), static_cast<size_t>(0x1000), true);
+    }
+
     // Read DOS header
     auto dos_header = ReadStruct<PE_DOS_HEADER>(base_address);
     if (!dos_header || dos_header->e_magic != DOS_MAGIC) {
@@ -142,19 +160,49 @@ std::vector<SectionInfo> PEDumper::GetSections(uint64_t base_address) {
     uint64_t section_offset = base_address + dos_header->e_lfanew + 4 +
                                sizeof(PE_FILE_HEADER) + opt_header_size;
 
-    for (uint16_t i = 0; i < num_sections_; i++) {
-        auto section = ReadStruct<PE_SECTION_HEADER>(section_offset + i * sizeof(PE_SECTION_HEADER));
-        if (!section) break;
+    if (scatter_read_ || (dma_ != nullptr && pid_ != 0)) {
+        // Use batched scatter read for section headers
+        std::vector<uint64_t> header_addrs;
+        header_addrs.reserve(num_sections_);
+        for (uint16_t i = 0; i < num_sections_; i++) {
+            header_addrs.push_back(section_offset + i * sizeof(PE_SECTION_HEADER));
+        }
 
-        SectionInfo info;
-        info.name = std::string(section->Name, strnlen(section->Name, 8));
-        info.virtual_address = section->VirtualAddress;
-        info.virtual_size = section->VirtualSize;
-        info.raw_size = section->SizeOfRawData;
-        info.raw_offset = section->PointerToRawData;
-        info.characteristics = section->Characteristics;
+        std::vector<std::optional<PE_SECTION_HEADER>> headers;
+        if (scatter_read_) {
+            headers = ::orpheus::MemoryReader::ReadBatch<PE_SECTION_HEADER>(scatter_read_, header_addrs);
+        } else {
+            headers = ::orpheus::MemoryReader::ReadBatch<PE_SECTION_HEADER>(dma_, pid_, header_addrs);
+        }
 
-        result.push_back(info);
+        for (const auto& section : headers) {
+            if (!section) break;
+
+            SectionInfo info;
+            info.name = std::string(section->Name, strnlen(section->Name, 8));
+            info.virtual_address = section->VirtualAddress;
+            info.virtual_size = section->VirtualSize;
+            info.raw_size = section->SizeOfRawData;
+            info.raw_offset = section->PointerToRawData;
+            info.characteristics = section->Characteristics;
+
+            result.push_back(info);
+        }
+    } else {
+        for (uint16_t i = 0; i < num_sections_; i++) {
+            auto section = ReadStruct<PE_SECTION_HEADER>(section_offset + i * sizeof(PE_SECTION_HEADER));
+            if (!section) break;
+
+            SectionInfo info;
+            info.name = std::string(section->Name, strnlen(section->Name, 8));
+            info.virtual_address = section->VirtualAddress;
+            info.virtual_size = section->VirtualSize;
+            info.raw_size = section->SizeOfRawData;
+            info.raw_offset = section->PointerToRawData;
+            info.characteristics = section->Characteristics;
+
+            result.push_back(info);
+        }
     }
 
     return result;
@@ -274,41 +322,100 @@ std::vector<ExportEntry> PEDumper::GetExports(uint64_t base_address) {
 
     // Build ordinal-to-name map
     std::map<uint16_t, std::string> ordinal_names;
-    for (uint32_t i = 0; i < exports->NumberOfNames; i++) {
-        auto name_rva = ReadStruct<uint32_t>(names_addr + i * 4);
-        auto ordinal = ReadStruct<uint16_t>(ordinals_addr + i * 2);
-        if (name_rva && ordinal) {
-            std::string name = ReadNullString(base_address + *name_rva);
-            ordinal_names[*ordinal] = name;
+    if (dma_ != nullptr && pid_ != 0 && exports->NumberOfNames > 0) {
+        // Batch read names and ordinals
+        std::vector<uint64_t> name_rva_addrs;
+        std::vector<uint64_t> ordinal_addrs;
+        name_rva_addrs.reserve(exports->NumberOfNames);
+        ordinal_addrs.reserve(exports->NumberOfNames);
+        for (uint32_t i = 0; i < exports->NumberOfNames; i++) {
+            name_rva_addrs.push_back(names_addr + i * 4);
+            ordinal_addrs.push_back(ordinals_addr + i * 2);
+        }
+
+        auto name_rvas = ::orpheus::utils::MemoryReader::ReadBatch<uint32_t>(dma_, pid_, name_rva_addrs);
+        auto ordinals = ::orpheus::utils::MemoryReader::ReadBatch<uint16_t>(dma_, pid_, ordinal_addrs);
+
+        for (size_t i = 0; i < exports->NumberOfNames; i++) {
+            if (i < name_rvas.size() && i < ordinals.size() && name_rvas[i] && ordinals[i]) {
+                std::string name = ReadNullString(base_address + *name_rvas[i]);
+                ordinal_names[*ordinals[i]] = name;
+            }
+        }
+    } else {
+        for (uint32_t i = 0; i < exports->NumberOfNames; i++) {
+            auto name_rva = ReadStruct<uint32_t>(names_addr + i * 4);
+            auto ordinal = ReadStruct<uint16_t>(ordinals_addr + i * 2);
+            if (name_rva && ordinal) {
+                std::string name = ReadNullString(base_address + *name_rva);
+                ordinal_names[*ordinal] = name;
+            }
         }
     }
 
     // Read all exported functions
-    for (uint32_t i = 0; i < exports->NumberOfFunctions; i++) {
-        auto func_rva = ReadStruct<uint32_t>(functions_addr + i * 4);
-        if (!func_rva || *func_rva == 0) continue;
-
-        ExportEntry entry;
-        entry.ordinal = static_cast<uint16_t>(exports->Base + i);
-        entry.rva = *func_rva;
-        entry.address = base_address + *func_rva;
-
-        // Check if ordinal has a name
-        auto name_it = ordinal_names.find(static_cast<uint16_t>(i));
-        if (name_it != ordinal_names.end()) {
-            entry.name = name_it->second;
+    if (dma_ != nullptr && pid_ != 0 && exports->NumberOfFunctions > 0) {
+        std::vector<uint64_t> func_rva_addrs;
+        func_rva_addrs.reserve(exports->NumberOfFunctions);
+        for (uint32_t i = 0; i < exports->NumberOfFunctions; i++) {
+            func_rva_addrs.push_back(functions_addr + i * 4);
         }
 
-        // Check if it's a forwarder (RVA points into export directory)
-        if (*func_rva >= export_dir.VirtualAddress &&
-            *func_rva < export_dir.VirtualAddress + export_dir.Size) {
-            entry.is_forwarder = true;
-            entry.forwarder_name = ReadNullString(base_address + *func_rva);
-        } else {
-            entry.is_forwarder = false;
-        }
+        auto func_rvas = ::orpheus::utils::MemoryReader::ReadBatch<uint32_t>(dma_, pid_, func_rva_addrs);
 
-        result.push_back(entry);
+        for (uint32_t i = 0; i < exports->NumberOfFunctions; i++) {
+            if (i >= func_rvas.size() || !func_rvas[i] || *func_rvas[i] == 0) continue;
+
+            uint32_t func_rva = *func_rvas[i];
+            ExportEntry entry;
+            entry.ordinal = static_cast<uint16_t>(exports->Base + i);
+            entry.rva = func_rva;
+            entry.address = base_address + func_rva;
+
+            // Check if ordinal has a name
+            auto name_it = ordinal_names.find(static_cast<uint16_t>(i));
+            if (name_it != ordinal_names.end()) {
+                entry.name = name_it->second;
+            }
+
+            // Check if it's a forwarder (RVA points into export directory)
+            if (func_rva >= export_dir.VirtualAddress &&
+                func_rva < export_dir.VirtualAddress + export_dir.Size) {
+                entry.is_forwarder = true;
+                entry.forwarder_name = ReadNullString(base_address + func_rva);
+            } else {
+                entry.is_forwarder = false;
+            }
+
+            result.push_back(entry);
+        }
+    } else {
+        for (uint32_t i = 0; i < exports->NumberOfFunctions; i++) {
+            auto func_rva = ReadStruct<uint32_t>(functions_addr + i * 4);
+            if (!func_rva || *func_rva == 0) continue;
+
+            ExportEntry entry;
+            entry.ordinal = static_cast<uint16_t>(exports->Base + i);
+            entry.rva = *func_rva;
+            entry.address = base_address + *func_rva;
+
+            // Check if ordinal has a name
+            auto name_it = ordinal_names.find(static_cast<uint16_t>(i));
+            if (name_it != ordinal_names.end()) {
+                entry.name = name_it->second;
+            }
+
+            // Check if it's a forwarder (RVA points into export directory)
+            if (*func_rva >= export_dir.VirtualAddress &&
+                *func_rva < export_dir.VirtualAddress + export_dir.Size) {
+                entry.is_forwarder = true;
+                entry.forwarder_name = ReadNullString(base_address + *func_rva);
+            } else {
+                entry.is_forwarder = false;
+            }
+
+            result.push_back(entry);
+        }
     }
 
     return result;

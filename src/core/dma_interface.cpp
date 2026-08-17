@@ -298,8 +298,10 @@ DMAInterface::DMAInterface(DMAInterface&& other) noexcept
     , device_type_(std::move(other.device_type_))
     , last_error_(std::move(other.last_error_))
     , error_callback_(std::move(other.error_callback_)) {
-    // Transfer cache config (MemoryCache contains mutex, not movable)
-    cache_.SetConfig(other.cache_.GetConfig());
+    // Transfer cache settings (MemoryCache contains mutex, not movable)
+    cache_.SetTTL(other.cache_.GetTTL());
+    cache_.SetMaxPages(other.cache_.GetMaxPages());
+    cache_.SetEnabled(other.cache_.IsEnabled());
     other.cache_.Clear();
     other.vmm_handle_ = nullptr;
 }
@@ -311,8 +313,10 @@ DMAInterface& DMAInterface::operator=(DMAInterface&& other) noexcept {
         device_type_ = std::move(other.device_type_);
         last_error_ = std::move(other.last_error_);
         error_callback_ = std::move(other.error_callback_);
-        // Transfer cache config (MemoryCache contains mutex, not movable)
-        cache_.SetConfig(other.cache_.GetConfig());
+        // Transfer cache settings (MemoryCache contains mutex, not movable)
+        cache_.SetTTL(other.cache_.GetTTL());
+        cache_.SetMaxPages(other.cache_.GetMaxPages());
+        cache_.SetEnabled(other.cache_.IsEnabled());
         other.cache_.Clear();
         other.vmm_handle_ = nullptr;
     }
@@ -598,21 +602,45 @@ std::vector<MemoryRegion> DMAInterface::GetMemoryRegions(uint32_t pid) {
 }
 
 std::vector<uint8_t> DMAInterface::ReadMemory(uint32_t pid, uint64_t address, size_t size) {
-    if (!IsConnected() || fn_MemReadEx == nullptr || size == 0) {
+    if (size == 0) {
         return {};
     }
 
-    // Check cache first
+    // 1. Check cache first (handles multi-page stitched hits)
     if (cache_.IsEnabled()) {
         if (auto cached = cache_.Get(pid, address, size)) {
             return *cached;
         }
     }
 
-    // Cache miss - do actual DMA read
+    if (!IsConnected() || fn_MemReadEx == nullptr) {
+        return {};
+    }
+
+    // 2. Page read-ahead: when reading a small region within a single 4KB page on cache miss,
+    // prefetch the full 4KB page into cache to minimize PCIe/FPGA transaction roundtrips.
+    const uint64_t start_page = address & ~(MemoryCache::PAGE_SIZE - 1);
+    const uint64_t end_page = (address + size - 1) & ~(MemoryCache::PAGE_SIZE - 1);
+
+    if (cache_.IsEnabled() && start_page == end_page && size < MemoryCache::PAGE_SIZE) {
+        auto page_data = ReadMemoryDirect(pid, start_page, MemoryCache::PAGE_SIZE);
+        const size_t offset_in_page = static_cast<size_t>(address - start_page);
+
+        if (page_data.size() >= offset_in_page + size) {
+            if (page_data.size() == MemoryCache::PAGE_SIZE) {
+                cache_.PutPage(pid, start_page, page_data);
+            } else {
+                cache_.Put(pid, start_page, page_data);
+            }
+            return std::vector<uint8_t>(page_data.begin() + offset_in_page,
+                                        page_data.begin() + offset_in_page + size);
+        }
+    }
+
+    // 3. Direct read (for multi-page reads, large reads, when prefetch fails, or when cache is disabled)
     auto result = ReadMemoryDirect(pid, address, size);
 
-    // Store in cache
+    // Store in cache if successful
     if (!result.empty() && cache_.IsEnabled()) {
         cache_.Put(pid, address, result);
     }
@@ -652,50 +680,208 @@ bool DMAInterface::WriteMemory(uint32_t pid, uint64_t address, const std::vector
     return success;
 }
 
-size_t DMAInterface::ScatterRead(uint32_t pid, std::vector<ScatterRequest>& requests) {
-    if (!IsConnected() || requests.empty()) return 0;
+namespace {
 
-    // Fallback to individual reads if scatter API not available
-    if (!fn_ScatterInit || !fn_ScatterPrepare || !fn_ScatterExecute || !fn_ScatterRead || !fn_ScatterClose) {
-        size_t success_count = 0;
-        for (auto& req : requests) {
-            auto data = ReadMemory(pid, req.address, req.size);
-            req.success = !data.empty();
-            if (req.success) {
-                req.data = std::move(data);
-                success_count++;
+struct ScatterSubChunk {
+    size_t request_index = 0;
+    uint64_t address = 0;
+    size_t size = 0;
+    size_t req_offset = 0;
+    std::vector<uint8_t> data;
+    bool success = false;
+};
+
+struct ScatterHandleGuard {
+    void* handle = nullptr;
+    ~ScatterHandleGuard() {
+        if (handle && fn_ScatterClose) {
+            fn_ScatterClose(handle);
+        }
+    }
+    explicit ScatterHandleGuard(void* h) : handle(h) {}
+    ScatterHandleGuard(const ScatterHandleGuard&) = delete;
+    ScatterHandleGuard& operator=(const ScatterHandleGuard&) = delete;
+    ScatterHandleGuard(ScatterHandleGuard&& other) noexcept : handle(other.handle) {
+        other.handle = nullptr;
+    }
+    ScatterHandleGuard& operator=(ScatterHandleGuard&& other) noexcept {
+        if (this != &other) {
+            if (handle && fn_ScatterClose) fn_ScatterClose(handle);
+            handle = other.handle;
+            other.handle = nullptr;
+        }
+        return *this;
+    }
+};
+
+constexpr size_t VMMDLL_SCATTER_BATCH_MAX = 512;
+
+} // anonymous namespace
+
+size_t DMAInterface::ScatterRead(uint32_t pid, std::vector<ScatterRequest>& requests) {
+    if (requests.empty()) return 0;
+
+    // 1. Cache pre-filtering
+    std::vector<size_t> unresolved_indices;
+    unresolved_indices.reserve(requests.size());
+
+    for (size_t i = 0; i < requests.size(); ++i) {
+        auto& req = requests[i];
+        req.success = false;
+        req.data.clear();
+
+        if (req.size == 0) {
+            req.success = true;
+            continue;
+        }
+
+        if (cache_.IsEnabled()) {
+            auto cached = cache_.Get(pid, req.address, req.size);
+            if (cached.has_value()) {
+                req.data = std::move(*cached);
+                req.success = true;
+                continue;
             }
         }
-        return success_count;
+
+        unresolved_indices.push_back(i);
     }
 
-    void* scatter = fn_ScatterInit(vmm_handle_, pid, 0);
-    if (!scatter) return 0;
-
-    for (const auto& req : requests) {
-        fn_ScatterPrepare(scatter, req.address, req.size);
+    // If all requests were resolved from cache (or size 0), return success count immediately
+    if (unresolved_indices.empty()) {
+        return std::count_if(requests.begin(), requests.end(), [](const auto& r) { return r.success; });
     }
 
-    if (!fn_ScatterExecute(scatter)) {
-        fn_ScatterClose(scatter);
-        return 0;
+    // If not connected to hardware, unresolved requests cannot be fulfilled via hardware
+    if (!IsConnected()) {
+        return std::count_if(requests.begin(), requests.end(), [](const auto& r) { return r.success; });
     }
 
-    size_t success_count = 0;
-    for (auto& req : requests) {
-        req.data.resize(req.size);
-        DWORD bytesRead = 0;
-        req.success = fn_ScatterRead(scatter, req.address, req.size, req.data.data(), &bytesRead) != 0;
-        if (req.success) {
-            req.data.resize(bytesRead);
-            success_count++;
-        } else {
-            req.data.clear();
+    // 2. Fallback to individual reads if scatter API is not fully loaded
+    if (!fn_ScatterInit || !fn_ScatterPrepare || !fn_ScatterExecute || !fn_ScatterRead || !fn_ScatterClose) {
+        for (size_t req_idx : unresolved_indices) {
+            auto& req = requests[req_idx];
+            auto data = ReadMemory(pid, req.address, req.size);
+            if (data.size() == req.size) {
+                req.data = std::move(data);
+                req.success = true;
+            } else {
+                req.data.clear();
+                req.success = false;
+            }
+        }
+        return std::count_if(requests.begin(), requests.end(), [](const auto& r) { return r.success; });
+    }
+
+    // 3. Cross-page splitting: split unresolved requests across 4KB page boundaries
+    std::vector<ScatterSubChunk> chunks;
+    std::vector<std::vector<size_t>> req_to_chunks(requests.size());
+
+    for (size_t req_idx : unresolved_indices) {
+        const auto& req = requests[req_idx];
+        uint64_t cur_addr = req.address;
+        size_t rem = req.size;
+        size_t req_offset = 0;
+
+        while (rem > 0) {
+            uint64_t page_base = cur_addr & ~(MemoryCache::PAGE_SIZE - 1);
+            size_t offset_in_page = static_cast<size_t>(cur_addr - page_base);
+            size_t chunk_size = std::min(rem, MemoryCache::PAGE_SIZE - offset_in_page);
+
+            size_t chunk_idx = chunks.size();
+            chunks.push_back(ScatterSubChunk{
+                .request_index = req_idx,
+                .address = cur_addr,
+                .size = chunk_size,
+                .req_offset = req_offset,
+                .data = {},
+                .success = false
+            });
+            req_to_chunks[req_idx].push_back(chunk_idx);
+
+            cur_addr += chunk_size;
+            req_offset += chunk_size;
+            rem -= chunk_size;
         }
     }
 
-    fn_ScatterClose(scatter);
-    return success_count;
+    // 4. Automated batching: execute scatter reads in batches up to VMMDLL_SCATTER_BATCH_MAX
+    const size_t total_chunks = chunks.size();
+    for (size_t batch_start = 0; batch_start < total_chunks; batch_start += VMMDLL_SCATTER_BATCH_MAX) {
+        const size_t batch_end = std::min(batch_start + VMMDLL_SCATTER_BATCH_MAX, total_chunks);
+
+        ScatterHandleGuard guard(fn_ScatterInit(vmm_handle_, pid, 0));
+        if (!guard.handle) {
+            // Scatter init failed for this batch; chunk successes remain false and fallback will handle them
+            continue;
+        }
+
+        // Prepare each chunk in batch
+        for (size_t k = batch_start; k < batch_end; ++k) {
+            fn_ScatterPrepare(guard.handle, chunks[k].address, static_cast<DWORD>(chunks[k].size));
+        }
+
+        // Execute scatter read
+        if (!fn_ScatterExecute(guard.handle)) {
+            // Scatter execute failed for this batch; fallback will handle them
+            continue;
+        }
+
+        // Read results for each chunk in batch
+        for (size_t k = batch_start; k < batch_end; ++k) {
+            auto& chunk = chunks[k];
+            chunk.data.resize(chunk.size);
+            DWORD bytes_read = 0;
+            BOOL ok = fn_ScatterRead(guard.handle, chunk.address, static_cast<DWORD>(chunk.size),
+                                     chunk.data.data(), &bytes_read);
+            if (ok && bytes_read == chunk.size) {
+                chunk.success = true;
+            } else {
+                chunk.data.clear();
+                chunk.success = false;
+            }
+        }
+    }
+
+    // 5. Reassembly, cache write-back, and transparent fallback
+    for (size_t req_idx : unresolved_indices) {
+        auto& req = requests[req_idx];
+        const auto& chunk_indices = req_to_chunks[req_idx];
+
+        bool all_chunks_succeeded = !chunk_indices.empty();
+        for (size_t c_idx : chunk_indices) {
+            if (!chunks[c_idx].success) {
+                all_chunks_succeeded = false;
+                break;
+            }
+        }
+
+        if (all_chunks_succeeded) {
+            req.data.resize(req.size);
+            for (size_t c_idx : chunk_indices) {
+                const auto& chunk = chunks[c_idx];
+                std::memcpy(req.data.data() + chunk.req_offset, chunk.data.data(), chunk.size);
+            }
+            req.success = true;
+
+            // Cache write-back: populate cache with freshly read scatter data
+            if (cache_.IsEnabled()) {
+                cache_.Put(pid, req.address, req.data);
+            }
+        } else {
+            // Transparent fallback to ReadMemory
+            auto data = ReadMemory(pid, req.address, req.size);
+            if (data.size() == req.size) {
+                req.data = std::move(data);
+                req.success = true;
+            } else {
+                req.data.clear();
+                req.success = false;
+            }
+        }
+    }
+
+    return std::count_if(requests.begin(), requests.end(), [](const auto& r) { return r.success; });
 }
 
 std::string DMAInterface::ReadString(uint32_t pid, uint64_t address, size_t max_length) {

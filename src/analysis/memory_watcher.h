@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/dma_interface.h"
+
 #include <vector>
 #include <string>
 #include <cstdint>
@@ -26,6 +28,8 @@ enum class WatchType {
  * MemoryChange - Detected change in memory
  */
 struct MemoryChange {
+    uint32_t watch_id = 0;
+    std::string name;
     uint64_t address;
     std::vector<uint8_t> old_value;
     std::vector<uint8_t> new_value;
@@ -60,12 +64,18 @@ struct WatchRegion {
 class MemoryWatcher {
 public:
     using ReadMemoryFunc = std::function<std::vector<uint8_t>(uint64_t address, size_t size)>;
+    using ScatterReadFunc = std::function<bool(std::vector<ScatterRequest>&)>;
     using ChangeCallback = std::function<void(const MemoryChange& change)>;
 
     /**
      * Create watcher with memory read function
      */
     explicit MemoryWatcher(ReadMemoryFunc read_func);
+
+    /**
+     * Create watcher with both sequential and scatter read functions
+     */
+    MemoryWatcher(ReadMemoryFunc read_func, ScatterReadFunc scatter_func);
     ~MemoryWatcher();
 
     // Disable copy
@@ -108,6 +118,11 @@ public:
      * @return Vector of detected changes
      */
     std::vector<MemoryChange> Scan();
+
+    /**
+     * Poll is an alias for Scan() for compatibility with poll-based consumers
+     */
+    std::vector<MemoryChange> Poll() { return Scan(); }
 
     /**
      * Start automatic scanning in background thread
@@ -157,6 +172,7 @@ private:
                       const std::vector<uint8_t>& new_val);
 
     ReadMemoryFunc read_memory_;
+    ScatterReadFunc scatter_read_;
     ChangeCallback change_callback_;
 
     mutable std::mutex mutex_;

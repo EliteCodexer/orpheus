@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/dma_interface.h"
+
 #include <vector>
 #include <string>
 #include <cstdint>
@@ -218,12 +220,25 @@ struct DumpOptions {
 class PEDumper {
 public:
     using ReadMemoryFunc = std::function<std::vector<uint8_t>(uint64_t address, size_t size)>;
+    using ScatterReadFunc = std::function<bool(std::vector<ScatterRequest>&)>;
 
     /**
      * Create a dumper with a memory read callback
      * @param read_func Function to read memory (pid is captured in closure)
      */
     explicit PEDumper(ReadMemoryFunc read_func);
+
+    /**
+     * Create a dumper with both sequential and scatter read callbacks
+     * @param read_func Function to read memory sequentially
+     * @param scatter_func Function to execute batched scatter reads
+     */
+    PEDumper(ReadMemoryFunc read_func, ScatterReadFunc scatter_func);
+
+    /**
+     * Create a dumper bound to a DMAInterface and process ID
+     */
+    PEDumper(DMAInterface* dma, uint32_t pid);
 
     /**
      * Dump a module from memory
@@ -284,7 +299,10 @@ private:
     uint32_t AlignUp(uint32_t value, uint32_t alignment);
     uint32_t RvaToOffset(uint32_t rva, const std::vector<PE_SECTION_HEADER>& sections);
 
+    DMAInterface* dma_ = nullptr;
+    uint32_t pid_ = 0;
     ReadMemoryFunc read_memory_;
+    ScatterReadFunc scatter_read_;
     std::string last_error_;
 
     // Cached header info

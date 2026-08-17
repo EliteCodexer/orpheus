@@ -256,15 +256,21 @@ public:
     [[nodiscard]] bool IsCacheEnabled() const { return cache_.IsEnabled(); }
 
     /**
-     * Configure cache parameters
+     * Cache TTL configuration
      */
-    void SetCacheConfig(const MemoryCache::Config& config) { cache_.SetConfig(config); }
-    [[nodiscard]] MemoryCache::Config GetCacheConfig() const { return cache_.GetConfig(); }
+    void SetCacheTTL(std::chrono::milliseconds ttl) { cache_.SetTTL(ttl); }
+    [[nodiscard]] std::chrono::milliseconds GetCacheTTL() const { return cache_.GetTTL(); }
+
+    /**
+     * Cache max pages configuration
+     */
+    void SetCacheMaxPages(size_t max_pages) { cache_.SetMaxPages(max_pages); }
+    [[nodiscard]] size_t GetCacheMaxPages() const { return cache_.GetMaxPages(); }
 
     /**
      * Get cache statistics (hits, misses, hit rate)
      */
-    [[nodiscard]] MemoryCache::Stats GetCacheStats() const { return cache_.GetStats(); }
+    [[nodiscard]] CacheStats GetCacheStats() const { return cache_.GetStats(); }
 
     /**
      * Clear cache
@@ -276,6 +282,39 @@ public:
      */
     void InvalidateCache(uint32_t pid, uint64_t address, size_t size) {
         cache_.Invalidate(pid, address, size);
+    }
+
+    /**
+     * Invalidate cache for entire process
+     */
+    void InvalidateCachePid(uint32_t pid) {
+        cache_.InvalidatePid(pid);
+    }
+
+    /**
+     * Manually put data into cache
+     */
+    void CacheMemory(uint32_t pid, uint64_t address, const std::vector<uint8_t>& data) {
+        cache_.Put(pid, address, data);
+    }
+
+    /**
+     * Get reference to underlying MemoryCache
+     */
+    MemoryCache& GetCache() noexcept { return cache_; }
+    const MemoryCache& GetCache() const noexcept { return cache_; }
+
+    /**
+     * Static / Section-aware cache region configuration
+     */
+    void SetStaticRegion(uint32_t pid, uint64_t address, size_t size) {
+        cache_.SetStaticRegion(pid, address, size);
+    }
+    void RemoveStaticRegion(uint32_t pid, uint64_t address, size_t size) {
+        cache_.RemoveStaticRegion(pid, address, size);
+    }
+    [[nodiscard]] bool IsInStaticRegion(uint32_t pid, uint64_t address, size_t size = 1) const {
+        return cache_.IsInStaticRegion(pid, address, size);
     }
 
 private:

@@ -257,10 +257,14 @@ if(TEST_SOURCES)
     add_executable(orpheus_tests ${TEST_SOURCES}
         # Pure-logic source files that can be tested without DMA
         src/analysis/pattern_scanner.cpp
+        src/analysis/memory_watcher.cpp
+        src/analysis/pe_dumper.cpp
         src/utils/expression_evaluator.cpp
         src/utils/bookmarks.cpp
         src/utils/logger.cpp
         src/core/memory_cache.cpp
+        src/core/dma_interface.cpp
+        src/core/runtime_manager.cpp
     )
     target_include_directories(orpheus_tests PRIVATE
         ${CMAKE_SOURCE_DIR}/src
@@ -270,6 +274,7 @@ if(TEST_SOURCES)
     target_link_libraries(orpheus_tests PRIVATE
         GTest::gtest_main
         spdlog::spdlog
+        ${VMM_LINK_LIB}
     )
     target_compile_features(orpheus_tests PRIVATE cxx_std_20)
 
